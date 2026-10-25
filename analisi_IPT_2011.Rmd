@@ -1,0 +1,896 @@
+---
+title: |
+  Anàlisi de l'índex de pobresa temporal
+  <br>
+  <span class="subtitle">Catalunya · 2011</span>
+
+author:
+  - name: "Aniol Vilamala Vidal"
+    affiliation: "Estadístic"
+  - name: "Marina Callejero González"
+    affiliation: "Investigadora"
+
+date: "`r format(Sys.Date(), '%d de %B de %Y')`"
+
+lang: ca
+
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    code_folding: hide
+    code_download: true
+    df_print: paged
+    self_contained: true
+    css: styles.css
+
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+
+params:
+  show_code: false
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 0 Llibreries, constants i funcions auxiliars
+
+Les llibreries s'haurien de citar a les referències del TFG amb `citation("llibreria")`.
+
+```{r llibreries}
+library(DT)
+library(rstatix)
+library(compareGroups)
+library(glmmTMB)
+library(broom.mixed)
+library(sjPlot)
+library(DHARMa)
+library(performance)
+library(ggstatsplot)
+library(tidyverse)
+
+select <- dplyr::select
+dir.create("sortides", showWarnings = FALSE)
+
+us_temps <- c("Temps disponible", "Cures personals", "Estudi",
+              "Treball remunerat", "Treball no remunerat")
+
+colors_ipt <- c("#95D0EA", "#9ACD32")
+```
+
+```{r funcions}
+etiqueta_p <- function(p, digits = 3) {
+  ifelse(p < 0.01, "p < 0.01", paste0("p = ", signif(p, digits)))
+}
+
+tema_tfg <- function(base_size = 14, angle = 0) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = angle, hjust = ifelse(angle > 0, 1, 0.5)),
+      plot.title = element_text(face = "bold"),
+      plot.title.position = "plot",
+      plot.margin = margin(10, 20, 10, 20)
+    )
+}
+
+mostra <- function(g, nom, w = 8, h = 7) {
+  ggsave(file.path("sortides", paste0(nom, ".png")), g, width = w, height = h)
+  g
+}
+
+# ---------- IPT segons una variable categòrica ----------
+
+resum_ipt <- function(dades, var) {
+  dades %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(Grup = .data[[var]]) %>%
+    summarise(N = n(), Pobres = sum(IPT_FACTOR == "Pobre"), .groups = "drop") %>%
+    mutate(
+      `% pobres` = round(Pobres / N * 100, 1),
+      `IC 95%` = map2_chr(Pobres, N, ~ {
+        ci <- binom.test(.x, .y)$conf.int * 100
+        sprintf("[%.1f, %.1f]", ci[1], ci[2])
+      })
+    )
+}
+
+chi_ipt <- function(dades, var) {
+  chisq.test(table(droplevels(dades[[var]]), dades$IPT_FACTOR))
+}
+
+interpreta_chi <- function(dades, var) {
+  p <- chi_ipt(dades, var)$p.value
+  paste0(
+    "El test χ² d'independència dóna ", etiqueta_p(p), ": ",
+    ifelse(p < 0.05,
+           "hi ha evidència d'una associació estadísticament significativa entre la variable i la pobresa temporal.",
+           "no s'observa una associació estadísticament significativa entre la variable i la pobresa temporal.")
+  )
+}
+
+pairwise_ipt <- function(dades, var) {
+  mat <- table(droplevels(dades[[var]]), dades$IPT_FACTOR)
+  pw <- pairwise.prop.test(x = mat[, "Pobre"], n = rowSums(mat),
+                           p.adjust.method = "holm")
+  as.data.frame(pw$p.value) %>%
+    rownames_to_column("grup1") %>%
+    pivot_longer(-grup1, names_to = "grup2", values_to = "p") %>%
+    filter(!is.na(p)) %>%
+    transmute(Comparació = paste(grup1, "vs", grup2),
+              `p-valor ajustat (Holm)` = etiqueta_p(p))
+}
+
+plot_ipt <- function(dades, var, titol, xlab, angle = 0) {
+  test <- chi_ipt(dades, var)
+  dades %>%
+    filter(!is.na(.data[[var]])) %>%
+    count(grup = .data[[var]], IPT_FACTOR) %>%
+    group_by(grup) %>%
+    mutate(percent = n / sum(n) * 100) %>%
+    ungroup() %>%
+    ggplot(aes(x = grup, y = percent, fill = IPT_FACTOR)) +
+    geom_col(color = "black", width = 0.7) +
+    geom_text(aes(label = paste0(round(percent, 1), "%")),
+              position = position_stack(vjust = 0.5), size = 4) +
+    scale_fill_manual(values = colors_ipt) +
+    scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 25),
+                       expand = expansion(mult = c(0, 0.08))) +
+    labs(title = titol,
+         subtitle = paste0("Test χ² d'independència (", etiqueta_p(test$p.value), ")"),
+         x = xlab, y = "Percentatge", fill = "IPT") +
+    tema_tfg(angle = angle)
+}
+
+# ---------- Ús del temps ----------
+
+taula_us_temps <- function(dades, var, caption) {
+  formula <- as.formula(paste(var, "~", paste0("`", us_temps, "`", collapse = " + ")))
+  res <- compareGroups(formula, data = dades)
+  export2md(createTable(res, show.all = TRUE, show.ci = TRUE),
+            format = "html", background = "#D2D2D2", header.color = "black",
+            caption = caption, size = 15)
+}
+
+plot_us_temps <- function(dades, var, titol, etiqueta, facet = NULL, angle = 30) {
+  dades <- dades %>% filter(!is.na(.data[[var]]))
+
+  proves <- dades %>%
+    group_by(across(all_of(c(facet, "US_TEMPS")))) %>%
+    rstatix::wilcox_test(as.formula(paste("HORES ~", var))) %>%
+    adjust_pvalue(method = "holm") %>%
+    mutate(p_label = etiqueta_p(p.adj, 2), y = max(dades$HORES) * 1.1)
+
+  g <- ggplot(dades, aes(x = US_TEMPS, y = HORES, fill = .data[[var]])) +
+    geom_violin(trim = FALSE, position = position_dodge(width = 0.55),
+                alpha = 0.45, color = NA, scale = "width", width = 0.5) +
+    geom_boxplot(width = 0.3, position = position_dodge(width = 0.55),
+                 outlier.shape = NA, alpha = 0.9, color = "black", linewidth = 0.5) +
+    geom_text(data = proves, aes(x = US_TEMPS, y = y, label = p_label),
+              inherit.aes = FALSE, size = 3.8) +
+    scale_fill_manual(values = colors_ipt) +
+    labs(title = titol, subtitle = "Test de Wilcoxon amb p-valors ajustats segons Holm",
+         x = "Ús del temps", y = "Hores diàries", fill = etiqueta) +
+    tema_tfg(angle = angle)
+
+  if (!is.null(facet)) g <- g + facet_wrap(facet)
+  g
+}
+
+plot_mitjanes <- function(dades, var, titol, etiqueta, facet = NULL, angle = 30) {
+  g <- dades %>%
+    filter(!is.na(.data[[var]])) %>%
+    group_by(across(all_of(c(facet, "US_TEMPS"))), grup = .data[[var]]) %>%
+    summarise(mitjana = mean(HORES), se = sd(HORES) / sqrt(n()), .groups = "drop") %>%
+    ggplot(aes(x = US_TEMPS, y = mitjana, fill = grup)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = mitjana - 1.96 * se, ymax = mitjana + 1.96 * se),
+                  position = position_dodge(width = 0.8), width = 0.2) +
+    scale_fill_manual(values = colors_ipt) +
+    labs(title = titol, subtitle = "Mitjana i interval de confiança al 95%",
+         x = "Ús del temps", y = "Mitjana d'hores", fill = etiqueta) +
+    tema_tfg(angle = angle)
+
+  if (!is.null(facet)) g <- g + facet_wrap(facet)
+  g
+}
+
+plots_us_temps_grups <- function(dades, var, etiqueta, angle = 45) {
+  dades <- dades %>% filter(!is.na(.data[[var]]))
+  map(levels(dades$US_TEMPS), function(ut) {
+    dades %>%
+      filter(US_TEMPS == ut) %>%
+      ggbetweenstats(
+        x = !!rlang::sym(var), y = HORES,
+        type = "nonparametric", p.adjust.method = "holm",
+        results.subtitle = FALSE, bf.message = FALSE,
+        title = paste0(ut, " segons ", etiqueta, " (2011)"),
+        xlab = etiqueta, ylab = "Hores diàries",
+        ggplot.component = list(theme(axis.text.x = element_text(angle = angle, hjust = 1)))
+      )
+  })
+}
+```
+
+# 1 Generació de les bases de dades
+
+## 1.1 Importació
+
+```{r, eval=FALSE}
+library(readr)
+library(dplyr)
+
+llegeix <- function(fitxer) {
+  read_delim(
+    fitxer,
+    delim = "\t",
+    escape_double = FALSE,
+    trim_ws = TRUE,
+    show_col_types = FALSE
+  )
+}
+
+# Crear la carpeta si no existeix
+dir.create("dta", showWarnings = FALSE, recursive = TRUE)
+
+# 1. Llars
+dades_llar <- llegeix("eut2011l.data.csv") %>%
+  mutate(CODI_LLAR = sprintf("%04d", CODI_LLAR))
+
+saveRDS(dades_llar, "dta/dades_llar_2011.rds")
+
+# 2. Individuals
+dades_indiv <- llegeix("eut2011i.data.csv") %>%
+  mutate(across(c(CODI_LLAR, CODI_PERSONA), as.character))
+
+saveRDS(dades_indiv, "dta/dades_indiv_2011.rds")
+
+# 3. Temps
+dades_temps <- llegeix("eut2011d.data.csv") %>%
+  mutate(
+    CODI_LLAR = sprintf("%04d", CODI_LLAR),
+    CODI_PERSONA = sprintf("%02d", CODI_PERSONA)
+  )
+
+saveRDS(dades_temps, "dta/dades_temps_2011.rds")
+```
+
+```{r importacio}
+dades_llar  <- readRDS("dta/dades_llar_2011.rds")
+dades_indiv <- readRDS("dta/dades_indiv_2011.rds")
+dades_temps <- readRDS("dta/dades_temps_2011.rds")
+```
+
+## 1.2 Base individual, hores per categoria i IPT
+
+```{r base}
+dades_base <- dades_indiv %>%
+  left_join(dades_llar, by = "CODI_LLAR") %>%
+  left_join(dades_temps, by = c("CODI_LLAR", "CODI_PERSONA")) %>%
+  rename(IDLLAR = CODI_LLAR, IDPERSONA = CODI_PERSONA)
+
+dades_base <- dades_base %>%
+  mutate(
+    treball_rem = (trebprin + desplaç_treb + altretreb) / 3600,
+    treball_no_rem = (culin + llarfam_ne + mantllar + confecc + jardi + repar +
+                        compra + gestio + curanen + curadul + organit + altllar +
+                        desplaç_llarfam + desplaç_vol) / 3600,
+    estudis = (estudis_ne + estudis + estudis_tll + desplaç_est) / 3600,
+    higiene = (dormir + menjar + altrecur) / 3600,
+    hores_lliures = 24 - treball_rem - treball_no_rem - estudis - higiene
+  )
+
+n_inicial <- nrow(dades_base)
+
+dades_base <- dades_base %>% filter(!is.na(hores_lliures))
+
+n_final <- nrow(dades_base)
+
+ipt_fgt <- function(temps, llindar = 0.5, alpha = 0) {
+  z <- llindar * median(temps, na.rm = TRUE)
+  time_poor <- ifelse(temps < z, 1, 0)
+
+  if (alpha == 0) {
+    fgt_value <- mean(time_poor)
+  } else {
+    gaps <- ifelse(time_poor == 1, (z - temps) / z, 0)
+    fgt_value <- mean(gaps^alpha)
+  }
+
+  list(index = fgt_value, llindar = z, pob_temps = time_poor)
+}
+
+res_ipt <- ipt_fgt(dades_base$hores_lliures)
+llindar_ipt <- res_ipt$llindar
+```
+
+## 1.3 Indicadors de voluntariat i ajuda, i recodificació
+
+```{r recodificacio}
+vars_vol <- paste0("T5_VOLUNTARIAT", setdiff(1:12, 6))
+
+vars_aj <- c("T5_VOLUNTARIAT6", paste0("T4_AJ_ALTRES", 1:10))
+
+dades_base <- dades_base %>%
+  mutate(
+    VOL_TOTAL = rowSums(across(all_of(vars_vol)) == 1, na.rm = TRUE),
+    AJ_TOTAL  = rowSums(across(all_of(vars_aj)) == 1, na.rm = TRUE),
+    IPT       = res_ipt$pob_temps,
+
+    SEXE = factor(Sexe, levels = c(6, 1), labels = c("Dona", "Home")),
+
+    TRAM_EDAT = cut(Edat, breaks = c(10, 25, 45, 65, Inf), right = FALSE,
+                    labels = c("10-24", "25-44", "45-64", "65+")),
+
+    AD_DEP = factor(T5_AD_DEP, levels = c(6, 1), labels = c("No", "Si")),
+
+    TIPUS_DIA = factor(T7_TIPUS_DIA, levels = 1:2,
+                       labels = c("Dia normal", "Dia inusual")),
+
+    TIPUS_LLAR = factor(
+      T5_TIPUS_LLAR, levels = c(3, 7, 1, 2, 5, 8, 6, 4, 9),
+      labels = c("Parella amb fills <25", "Parella amb fills <25",
+                 "Unipersonal", "Parella sense fills",
+                 "Monoparental fills <25", "Monoparental fills <25",
+                 "Monoparental fills ≥25", "Parella amb fills ≥25", "Altres")
+    ),
+
+    DEGURBA = factor(DIM_MUN, levels = 1:3,
+                     labels = c("-20.000 habitants", "20.000-100.000 habitants",
+                                "+100.000 habitants")),
+
+    NAC = factor(T6_NACIONALITAT, levels = 1:4,
+                 labels = c("Espanyola", "Estrangera", "Estrangera", "Estrangera")),
+
+    ESTAT_CIVIL = factor(T6_ESTAT_CIVIL, levels = 1:4,
+                         labels = c("Solter/a", "Casat/ada", "Vidu/a", "Divorciat/ada")),
+
+    ESTUDI_ALT = factor(
+      T6_ESTUDI_ALT, levels = 1:9,
+      labels = c("Primaria o inferior", "Primaria o inferior", "Primaria o inferior",
+                 "Secundaria 1a etapa",
+                 "Secundaria 2a etapa", "Secundaria 2a etapa", "Secundaria 2a etapa",
+                 "Superior", "Superior")
+    ),
+
+    REL_ACT = factor(T3_SITUACIO_ACTIV, levels = 1:4,
+                     labels = c("Ocupat", "Aturat", "Jubilat", "Inactiu")),
+
+    TRAM_INGRESSOS = factor(
+      T5_INGRESSOS, levels = 1:10,
+      labels = c("700 € o menys", "De 701 € a 1.000 €", "De 1.001 € a 1.400 €",
+                 "De 1.401 € a 1.700 €", "De 1.701 € a 2.000 €",
+                 "De 2.001 € a 2.300 €", "De 2.301 € a 2.600 €",
+                 "De 2.601 € a 3.100 €", "De 3.101 € a 4.000 €", "Més de 4.000 €")
+    ),
+
+    TRAM_INGRESSOS_REDUIT = factor(
+      T5_INGRESSOS, levels = 1:10,
+      labels = c("700 € o menys",
+                 "De 701 € a 1.400 €", "De 701 € a 1.400 €",
+                 "De 1.401 € a 2.000 €", "De 1.401 € a 2.000 €",
+                 "De 2.001 € a 2.600 €", "De 2.001 € a 2.600 €",
+                 "Més de 2.600 €", "Més de 2.600 €", "Més de 2.600 €")
+    )
+  ) %>%
+  rename(NUM_MEMBRES = T5_NUM_MEMBRES)
+```
+
+## 1.4 Bases de dades finals
+
+### 1.4.1 `dades_models_2011`
+
+```{r dades_models}
+dades_models_2011 <- dades_base %>%
+  select(
+    IDLLAR, IDPERSONA, IPT,
+    SEXE, TRAM_EDAT, AD_DEP, TIPUS_LLAR, TIPUS_DIA, DEGURBA, NUM_MEMBRES,
+    NAC, ESTAT_CIVIL, ESTUDI_ALT, REL_ACT, TRAM_INGRESSOS, TRAM_INGRESSOS_REDUIT,
+    AJ_TOTAL, VOL_TOTAL
+  )
+```
+
+### 1.4.2 `dades_wide_2011`
+
+```{r dades_wide}
+dades_wide_2011 <- dades_base %>%
+  transmute(
+    IDLLAR, IDPERSONA,
+    IPT_FACTOR = factor(IPT, levels = c(0, 1), labels = c("No pobre", "Pobre")),
+    `Temps disponible`     = hores_lliures,
+    `Cures personals`      = higiene,
+    `Estudi`               = estudis,
+    `Treball remunerat`    = treball_rem,
+    `Treball no remunerat` = treball_no_rem,
+    SEXE, TRAM_EDAT, DEGURBA, NAC, TIPUS_LLAR, ESTUDI_ALT,
+    TRAM_INGRESSOS, TRAM_INGRESSOS_REDUIT
+  )
+```
+
+### 1.4.3 `dades_long_2011`
+
+```{r dades_long}
+dades_long_2011 <- dades_wide_2011 %>%
+  pivot_longer(cols = all_of(us_temps), names_to = "US_TEMPS", values_to = "HORES") %>%
+  mutate(US_TEMPS = factor(US_TEMPS, levels = us_temps))
+```
+
+```{r neteja}
+rm(dades_llar, dades_indiv, dades_temps, dades_base)
+
+tibble(
+  Base = c("dades_models_2011", "dades_wide_2011", "dades_long_2011"),
+  Files = c(nrow(dades_models_2011), nrow(dades_wide_2011), nrow(dades_long_2011)),
+  Columnes = c(ncol(dades_models_2011), ncol(dades_wide_2011), ncol(dades_long_2011))
+) %>%
+  knitr::kable(caption = "Bases de dades finals")
+```
+
+# 2 Índex de Pobresa Temporal (IPT)
+
+## 2.1 Definició
+
+La metodologia habitual per mesurar la pobresa de temps segueix la proposta de Foster, Greer i Thorbecke (1984), tal com l'apliquen Vega-Rapun, Domínguez-Serrano i Gálvez-Muñoz (*The multidimensionality of poverty: Time poverty in Spain*):
+
+\[
+FGT_\alpha = \frac{1}{N} \sum_{i=1}^{q} \left( \frac{z - y_i}{z} \right)^\alpha
+\]
+
+on \(z\) és el llindar de pobresa de temps, \(N\) la població total, \(q\) el nombre de persones pobres en temps, \(y_i\) el temps disponible de l'individu \(i\) i \(\alpha\) el paràmetre d'aversió a la pobresa:
+
+```{r}
+tibble(
+  `Valor d'α` = 0:2,
+  `Nom de la mesura` = c("Headcount index", "Poverty gap", "Severity index"),
+  Interpretació = c(
+    "Proporció d'individus amb temps disponible inferior al llindar.",
+    "Intensitat mitjana de la pobresa: quant falta, proporcionalment, per arribar al llindar.",
+    "Penalitza més les situacions de pobresa extrema; mesura la desigualtat entre els pobres."
+  )
+) %>%
+  knitr::kable()
+```
+
+Aquest treball utilitza el *headcount index* (\(\alpha = 0\)) amb el llindar \(z\) fixat com el 50% de la mediana del temps disponible:
+
+\[
+H = \frac{q}{N}
+\]
+
+Així, cada persona és pobra en temps (1) o no (0). Aquest indicador és l'**Índex de Pobresa Temporal (IPT)**. La funció `ipt_fgt()` permet calcular també la resta d'índexs FGT.
+
+El llindar de pobresa temporal és de **`r round(llindar_ipt, 2)` hores** diàries de temps disponible: les persones per sota d'aquest valor es classifiquen com a pobres en temps. La mostra d'anàlisi té **`r n_final` individus** (se n'han eliminat `r n_inicial - n_final` per no disposar de diari d'activitats) i el **`r round(100 * mean(dades_wide_2011$IPT_FACTOR == "Pobre"), 2)`%** presenta pobresa temporal.
+
+```{r}
+resum_ipt(dades_wide_2011 %>% mutate(Total = factor("Total")), "Total") %>%
+  knitr::kable(caption = "Prevalença global de pobresa temporal (2011)")
+```
+
+## 2.2 Variables d'estudi
+
+```{r}
+tibble(
+  Variable = c("DEGURBA", "TIPUS_LLAR", "TIPUS_DIA", "NUM_MEMBRES", "AD_DEP", "NAC",
+               "ESTAT_CIVIL", "ESTUDI_ALT", "TRAM_EDAT", "SEXE", "REL_ACT",
+               "TRAM_INGRESSOS", "TRAM_INGRESSOS_REDUIT", "AJ_TOTAL", "VOL_TOTAL"),
+  Descripció = c(
+    "Mida del municipi (`DIM_MUN`; a la BD del 2024 és el grau d'urbanització)",
+    "Composició de la llar (categories harmonitzades amb el 2024)",
+    "Dia atípic o normal", "Nombre de membres de la llar",
+    "Adults en situació de dependència a la llar", "Nacionalitat",
+    "Estat civil legal", "Estudi de més alt nivell assolit (agrupat en 4 nivells)",
+    "Tram d'edat", "Sexe", "Relació amb l'activitat econòmica",
+    "Tram d'ingressos mensuals de la llar (10 trams)",
+    "Tram d'ingressos agrupat en 5 trams",
+    "Nombre d'àmbits en què la persona ha ajudat (voluntariat d'assistència i ajudes a altres llars)",
+    "Nombre de tipus de voluntariat realitzats"
+  )
+) %>%
+  knitr::kable(caption = "Variables considerades")
+```
+
+# 3 Anàlisi exploratòria de dades (AED)
+
+## 3.0 Proves i tests estadístics utilitzats
+
+#### **0. Les hores d'ús del temps segueixen una distribució normal?**
+
+Si els punts del Q-Q plot s'allunyen molt de la línia, la variable no és normal.
+
+```{r, fig.width=6, fig.height=5}
+walk(us_temps, ~ {
+  qqnorm(dades_wide_2011[[.x]], main = .x)
+  qqline(dades_wide_2011[[.x]], col = "red")
+})
+```
+
+Si cap variable és gaussiana, caldrà fer servir tests no paramètrics.
+
+#### **1. Dues variables categòriques: test χ² i comparacions 2 a 2**
+
+Per analitzar si dues variables categòriques (per exemple, IPT i DEGURBA) estan relacionades, s'utilitza el test χ² d'independència. Les hipòtesis són:
+
+\[
+H_0: \text{Les variables són independents} \qquad 
+H_1: \text{Les variables no són independents}
+\]
+
+Si el test χ² indica diferències significatives, es fan comparacions 2 a 2 entre els nivells del factor amb `pairwise.prop.test(..., p.adjust.method = "holm")`, que permet identificar entre quins nivells hi ha diferències de proporcions.
+
+#### **2. Variable contínua HORES segons una variable categòrica**
+
+Com que les hores no segueixen una distribució normal i presenten asimetries, s'utilitza un enfocament no paramètric. Per a cada ús del temps (`US_TEMPS`):
+
+- Amb dos grups, test de Wilcoxon (`rstatix::wilcox_test`).
+
+- Amb més de dos grups, `ggbetweenstats`, que combina un test global de Kruskal–Wallis, comparacions post-hoc 2 a 2 (Dunn), correcció de Holm i la representació amb violí + caixa.
+
+Les hipòtesis són:
+
+\[
+H_0: \text{Les distribucions de les mostres són iguals} \qquad
+H_1: \text{Les distribucions difereixen}
+\]
+
+#### **3. Gràfics de barres amb intervals de confiança**
+
+Com a complement visual, es representen les mitjanes d'hores per grup amb intervals de confiança del 95%. Aquest enfocament és descriptiu i facilita la interpretació de les diferències entre grups.
+
+#### **4. Correcció de Holm**
+
+En totes les comparacions múltiples s'aplica la correcció de Holm, que controla l'error familiar (FWER) i és menys conservadora que la de Bonferroni.
+
+## 3.1 IPT i ús del temps
+
+```{r}
+taula_us_temps(dades_wide_2011, "IPT_FACTOR", "Distribució del temps segons pobresa temporal (2011)")
+```
+
+La taula mostra la mitjana (i l'IC al 95%) de les hores dedicades a cada activitat, primer en tota la mostra i després estratificant per no pobres i pobres en temps. El p-valor de l'última columna contrasta si els dos grups dediquen el mateix temps a cada activitat.
+
+```{r, fig.width=10, fig.height=7}
+mostra(plot_us_temps(dades_long_2011, "IPT_FACTOR",
+                     "Distribució d'hores segons ús del temps i IPT (2011)", "IPT"),
+       "us_temps_ipt_2011", 10, 7)
+
+mostra(plot_mitjanes(dades_long_2011, "IPT_FACTOR",
+                     "Mitjana d'hores per ús del temps segons IPT (2011)", "IPT"),
+       "mitjanes_ipt_2011", 10, 7)
+```
+
+El gràfic de violins i caixes mostra la distribució: la línia negra de la caixa és la mediana, els extrems de la caixa el 25% i el 75%, i l'amplada del violí la densitat d'individus.
+
+## 3.2 Sexe
+
+```{r}
+taula_us_temps(dades_wide_2011, "SEXE", "Distribució del temps segons sexe (2011)")
+```
+
+### 3.2.1 IPT segons sexe
+
+```{r, fig.width=7, fig.height=7}
+knitr::kable(resum_ipt(dades_wide_2011, "SEXE"), caption = "Pobresa temporal segons sexe (2011)")
+
+mostra(plot_ipt(dades_wide_2011, "SEXE", "IPT segons el sexe (2011)", "Sexe"),
+       "ipt_sexe_2011", 7, 7)
+```
+
+`r interpreta_chi(dades_wide_2011, "SEXE")`
+
+### 3.2.2 Ús del temps segons sexe
+
+```{r, fig.width=10, fig.height=7}
+mostra(plot_us_temps(dades_long_2011, "SEXE",
+                     "Distribució d'hores segons ús del temps i sexe (2011)", "Sexe", angle = 45),
+       "us_temps_sexe_2011", 10, 7)
+
+mostra(plot_mitjanes(dades_long_2011, "SEXE",
+                     "Mitjana d'hores per ús del temps segons sexe (2011)", "Sexe", angle = 45),
+       "mitjanes_sexe_2011", 10, 7)
+```
+
+### 3.2.3 Sexe i IPT envers l'ús del temps
+
+```{r, fig.width=12, fig.height=7}
+mostra(plot_us_temps(dades_long_2011, "IPT_FACTOR",
+                     "Ús del temps segons sexe i pobresa temporal (2011)", "IPT", facet = "SEXE"),
+       "us_temps_sexe_ipt_2011", 12, 7)
+
+mostra(plot_mitjanes(dades_long_2011, "IPT_FACTOR",
+                     "Mitjana d'hores segons sexe i pobresa temporal (2011)", "IPT", facet = "SEXE"),
+       "mitjanes_sexe_ipt_2011", 12, 7)
+```
+
+## 3.3 Mida del municipi (`DEGURBA`)
+
+### 3.3.1 IPT segons la mida del municipi
+
+```{r, fig.width=9, fig.height=7}
+knitr::kable(resum_ipt(dades_wide_2011, "DEGURBA"), caption = "Pobresa temporal segons mida del municipi (2011)")
+
+mostra(plot_ipt(dades_wide_2011, "DEGURBA", "IPT segons la mida del municipi (2011)",
+                "Mida del municipi", angle = 25),
+       "ipt_degurba_2011", 9, 7)
+
+knitr::kable(pairwise_ipt(dades_wide_2011, "DEGURBA"),
+             caption = "Comparacions per parelles (proporcions, ajust de Holm)")
+```
+
+`r interpreta_chi(dades_wide_2011, "DEGURBA")` Si el test global no és significatiu, les comparacions per parelles no són necessàries; es mostren a títol d'exemple.
+
+### 3.3.2 Ús del temps segons la mida del municipi
+
+```{r, fig.width=9, fig.height=7}
+walk(plots_us_temps_grups(dades_long_2011, "DEGURBA", "mida del municipi", angle = 25), print)
+```
+
+## 3.4 Nacionalitat
+
+### 3.4.1 IPT segons la nacionalitat
+
+```{r, fig.width=8, fig.height=7}
+knitr::kable(resum_ipt(dades_wide_2011, "NAC"), caption = "Pobresa temporal segons nacionalitat (2011)")
+
+mostra(plot_ipt(dades_wide_2011, "NAC", "IPT segons la nacionalitat (2011)", "Nacionalitat"),
+       "ipt_nac_2011")
+```
+
+`r interpreta_chi(dades_wide_2011, "NAC")`
+
+### 3.4.2 Ús del temps segons la nacionalitat
+
+```{r, fig.width=10, fig.height=7}
+mostra(plot_us_temps(dades_long_2011, "NAC",
+                     "Distribució d'hores segons ús del temps i nacionalitat (2011)",
+                     "Nacionalitat", angle = 45),
+       "us_temps_nac_2011", 10, 7)
+
+mostra(plot_mitjanes(dades_long_2011, "NAC",
+                     "Mitjana d'hores per ús del temps segons nacionalitat (2011)",
+                     "Nacionalitat", angle = 45),
+       "mitjanes_nac_2011", 10, 7)
+```
+
+## 3.5 Tipus de llar
+
+### 3.5.1 IPT segons el tipus de llar
+
+```{r, fig.width=9, fig.height=7}
+knitr::kable(resum_ipt(dades_wide_2011, "TIPUS_LLAR"), caption = "Pobresa temporal segons tipus de llar (2011)")
+
+mostra(plot_ipt(dades_wide_2011, "TIPUS_LLAR", "IPT segons el tipus de llar (2011)",
+                "Tipus de llar", angle = 45),
+       "ipt_tipus_llar_2011", 9, 7)
+
+datatable(pairwise_ipt(dades_wide_2011, "TIPUS_LLAR"), rownames = FALSE,
+          caption = "Comparacions per parelles (proporcions, ajust de Holm)",
+          options = list(pageLength = 10))
+```
+
+`r interpreta_chi(dades_wide_2011, "TIPUS_LLAR")`
+
+### 3.5.2 Ús del temps segons el tipus de llar
+
+```{r, fig.width=12, fig.height=9}
+walk(plots_us_temps_grups(dades_long_2011, "TIPUS_LLAR", "tipus de llar"), print)
+```
+
+## 3.6 Tram d'ingressos
+
+### 3.6.1 IPT segons el tram d'ingressos
+
+```{r, fig.width=10, fig.height=7}
+knitr::kable(resum_ipt(dades_wide_2011, "TRAM_INGRESSOS"), caption = "Pobresa temporal segons tram d'ingressos (2011)")
+
+mostra(plot_ipt(dades_wide_2011, "TRAM_INGRESSOS", "IPT segons el tram d'ingressos (2011)",
+                "Tram d'ingressos", angle = 45),
+       "ipt_tram_ingressos_2011", 10, 7)
+
+datatable(pairwise_ipt(dades_wide_2011, "TRAM_INGRESSOS"), rownames = FALSE,
+          caption = "Comparacions per parelles (proporcions, ajust de Holm)",
+          options = list(pageLength = 10))
+```
+
+`r interpreta_chi(dades_wide_2011, "TRAM_INGRESSOS")`
+
+### 3.6.2 Ús del temps segons el tram d'ingressos
+
+Per no saturar els gràfics amb comparacions, s'utilitza el tram d'ingressos agrupat en 5 categories (`TRAM_INGRESSOS_REDUIT`).
+
+```{r, fig.width=11, fig.height=8}
+walk(plots_us_temps_grups(dades_long_2011, "TRAM_INGRESSOS_REDUIT", "tram d'ingressos"), print)
+```
+
+# 4 Modelització
+
+## 4.1 Interpretació dels models logit
+
+#### 1. Fórmula general d'un model logístic
+
+Un model logístic (o logit) amb efectes fixos i aleatoris té la forma:
+
+\[
+\text{logit}(P(Y=1)) = \log\left(\frac{P(Y=1)}{1-P(Y=1)}\right)
+= \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \cdots + u_j
+\]
+
+on:
+
+- \(Y = 1\) és l'esdeveniment (**pobresa temporal**)
+- \(u_j\) és l'intercept aleatori del grup \(j\) (la **llar**)
+- els \(\beta\) són coeficients en **log-odds**
+
+#### 2. Per què s'exponencien els coeficients?
+
+Els coeficients \(\beta\) estan en log-odds, que són difícils d'interpretar. Per això es calcula l'*odds ratio*:
+
+\[
+\text{OR} = e^{\beta}
+\]
+
+- **OR > 1** → augmenta la probabilitat de pobresa temporal
+- **OR < 1** → disminueix la probabilitat de pobresa temporal
+- **OR = 1** → cap efecte
+
+#### 3. Interpretació segons el tipus de variable
+
+- **Variables numèriques.** Per cada unitat addicional de \(X\), les *odds* de pobresa temporal es multipliquen per l'OR. Si \(\beta_1 = 0.20\), l'OR és \(e^{0.20} = 1.22\): les odds augmenten un **22%**.
+
+- **Variables categòriques.** Cada categoria es compara amb la categoria de referència. Un OR de 1.71 vol dir un 71% més d'odds que la categoria base; un OR de 0.304, un 70% menys d'odds.
+
+- **Variables dicotòmiques.** S'interpreten igual. Si `SEXEHome` té un OR de 0.77, els homes tenen un 23% menys d'odds de pobresa temporal que les dones.
+
+- **Intervals de confiança.** Un OR només és significatiu si l'IC al 95% no inclou l'1. Amb OR = 1.33 i IC95% = [1.05, 1.68] l'efecte és significatiu; amb OR = 0.96 i IC95% = [0.68, 1.36] no hi ha evidència d'efecte.
+
+- **Intercept.** És el logit de la probabilitat de pobresa temporal per al perfil base (totes les variables a la categoria de referència o a 0). Exponenciat, dona les odds del perfil base.
+
+- **Efectes aleatoris (`1 | IDLLAR`).** Cada llar té un intercept propi que recull les diferències no observades entre llars i la correlació entre individus d'una mateixa llar. No s'interpreta com un coeficient, sinó com a variabilitat entre grups no explicada pels predictors.
+
+## 4.2 Ajust i selecció de models
+
+```{r models}
+mod0 <- glm(
+  IPT ~ SEXE + TRAM_EDAT + AD_DEP + DEGURBA + TIPUS_LLAR + TIPUS_DIA +
+    NAC + ESTAT_CIVIL + ESTUDI_ALT + NUM_MEMBRES + AJ_TOTAL +
+    VOL_TOTAL + REL_ACT,
+  data = dades_models_2011, family = binomial(link = "logit"))
+
+mod1 <- glmmTMB(
+  IPT ~ SEXE + TRAM_EDAT + AD_DEP + DEGURBA + TIPUS_LLAR + TIPUS_DIA +
+    NAC + ESTAT_CIVIL + ESTUDI_ALT + NUM_MEMBRES + AJ_TOTAL +
+    VOL_TOTAL + REL_ACT + (1 | IDLLAR),
+  data = dades_models_2011, family = binomial(link = "logit"))
+
+mod2 <- glmmTMB(
+  IPT ~ SEXE + TRAM_EDAT + AD_DEP + DEGURBA + TIPUS_LLAR + TIPUS_DIA +
+    NAC + ESTUDI_ALT + AJ_TOTAL + VOL_TOTAL + REL_ACT + (1 | IDLLAR),
+  data = dades_models_2011, family = binomial(link = "logit"))
+
+mod3 <- glmmTMB(
+  IPT ~ SEXE + TRAM_EDAT + DEGURBA + TIPUS_LLAR + TIPUS_DIA + NAC + ESTUDI_ALT +
+    VOL_TOTAL + REL_ACT + (1 | IDLLAR),
+  data = dades_models_2011, family = binomial(link = "logit"))
+
+mod4 <- glmmTMB(
+  IPT ~ SEXE + TRAM_EDAT + DEGURBA + TIPUS_LLAR + TIPUS_DIA + NAC + ESTUDI_ALT +
+    REL_ACT + (1 | IDLLAR),
+  data = dades_models_2011, family = binomial(link = "logit"))
+```
+
+Els models es comparen amb els criteris AIC i BIC, amb proves de raó de versemblança entre models niats (`mod1` ⊃ `mod2` ⊃ `mod3` ⊃ `mod4`) i amb el criteri teòric de les variables que es volen estudiar, encara que no siguin significatives.
+
+```{r}
+comparacio <- AIC(mod0, mod1, mod2, mod3, mod4) %>%
+  rownames_to_column("Model") %>%
+  left_join(BIC(mod0, mod1, mod2, mod3, mod4) %>% rownames_to_column("Model") %>% select(Model, BIC),
+            by = "Model")
+
+knitr::kable(comparacio, digits = 1, caption = "Comparació de models (AIC i BIC)")
+```
+
+```{r}
+anova(mod1, mod2, mod3, mod4) %>%
+  as.data.frame() %>%
+  knitr::kable(digits = 3, caption = "Proves de raó de versemblança entre models niats")
+```
+
+```{r}
+mod_final <- mod4
+```
+
+## 4.3 Model final
+
+### 4.3.1 Efectes fixos
+
+```{r}
+summary(mod_final)
+```
+
+*Odds ratios* i intervals de confiança al 95%:
+
+```{r}
+taula_or <- broom.mixed::tidy(mod_final, effects = "fixed", conf.int = TRUE, exponentiate = TRUE) %>%
+  transmute(Variable = term, OR = estimate,
+            `IC 95% inf.` = conf.low, `IC 95% sup.` = conf.high, `p-valor` = p.value) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+datatable(taula_or, rownames = FALSE, options = list(pageLength = 15)) %>%
+  formatStyle("p-valor", fontWeight = styleInterval(0.05, c("bold", "normal")))
+```
+
+```{r, fig.width=9, fig.height=8}
+plot_model(mod_final, transform = "exp", show.values = TRUE, value.offset = 0.3,
+           title = "Odds ratios del model final (IC 95%)") +
+  theme_sjplot()
+```
+
+### 4.3.2 Efectes aleatoris
+
+```{r}
+VarCorr(mod_final)
+
+sigma_re <- unname(attr(VarCorr(mod_final)$cond$IDLLAR, "stddev"))
+
+ranef(mod_final)$cond$IDLLAR %>%
+  as.data.frame() %>%
+  ggplot(aes(x = `(Intercept)`)) +
+  geom_histogram(bins = 40, fill = "#95D0EA", color = "black") +
+  labs(title = "Distribució dels interceptes aleatoris per llar",
+       x = "Intercept aleatori (log-odds)", y = "Nombre de llars") +
+  tema_tfg()
+```
+
+La desviació estàndard de l'intercept aleatori és de σ = `r round(sigma_re, 3)`.
+
+```{r}
+icc_mod <- performance::icc(mod_final)
+r2_mod <- performance::r2(mod_final)
+
+tibble(
+  Mesura = c("ICC ajustat", "ICC no ajustat", "R² marginal (Nakagawa)", "R² condicional (Nakagawa)"),
+  Valor = round(c(icc_mod$ICC_adjusted, icc_mod$ICC_unadjusted,
+                  unname(r2_mod$R2_marginal), unname(r2_mod$R2_conditional)), 3)
+) %>%
+  knitr::kable(caption = "Variabilitat entre llars i capacitat explicativa")
+```
+
+L'ICC no ajustat respon a quanta variació hi ha entre grups en general; l'ICC ajustat, a quanta en queda un cop explicada la part atribuïble a les covariables. Amb un ICC ajustat de `r round(icc_mod$ICC_adjusted, 3)`, aproximadament el `r round(100 * icc_mod$ICC_adjusted, 1)`% de la variabilitat latent és atribuïble a diferències entre llars. L'R² marginal (`r round(unname(r2_mod$R2_marginal), 3)`) indica la part explicada pels efectes fixos, i el condicional (`r round(unname(r2_mod$R2_conditional), 3)`) la part explicada per fixos i aleatoris conjuntament.
+
+### 4.3.3 Validació del model
+
+```{r, fig.width=10, fig.height=5}
+res_sim <- simulateResiduals(mod_final)
+proves_res <- testResiduals(res_sim, plot = FALSE)
+
+tibble(
+  Test = c("Uniformitat (Kolmogorov-Smirnov)", "Dispersió", "Outliers"),
+  `p-valor` = round(c(proves_res$uniformity$p.value,
+                      proves_res$dispersion$p.value,
+                      proves_res$outliers$p.value), 3)
+) %>%
+  knitr::kable(caption = "Tests sobre els residus simulats (DHARMa)")
+
+plot(res_sim)
+```
+
+```{r}
+check_collinearity(mod_final) %>%
+  as.data.frame() %>%
+  knitr::kable(digits = 2, caption = "Multicol·linealitat (VIF)")
+```
+
+Un p-valor superior a 0.05 als tests de DHARMa indica que no hi ha desviacions significatives respecte als supòsits del model, i valors de VIF inferiors a 5 indiquen absència de problemes rellevants de col·linealitat.
